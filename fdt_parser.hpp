@@ -4,15 +4,17 @@
 #include <cstdint>
 #include <cstring>
 
-// TODO: remove
-#include <iostream>
-
+// ACCORDING TO DTS SPECIFICATION
 #define FDT_MAGIC 0xD00DFEED
 #define FDT_BEGIN_NODE 0x00000001
 #define FDT_END_NODE 0x00000002
 #define FDT_PROP 0x00000003
 #define FDT_NOP 0x00000004
 #define FDT_END 0x00000009
+
+// RETURN VALUES FOR TRAVERSAL FUNCTION
+#define ALL_OK 0
+#define INVALID_STRUCTURE_BLOCK -1
 
 
 namespace fdt {
@@ -60,7 +62,6 @@ namespace fdt {
         static const uint32_t* get_structure_block_ptr(const fdt_header* header);
         static const char* get_string_block_ptr(const fdt_header* header);
         static int traverse_node(const uint32_t*& token_ptr, const fdt_header* header, TraversalAction& action);
-        static int traverse_structure_block(const fdt_header* header, TraversalAction& action);
     };
     
     class FdtNode {
@@ -76,8 +77,9 @@ namespace fdt {
         FdtNode() = default; // For invalid nodes
         ~FdtNode() = default;
 
-        virtual FdtNode get_sub_node(const char* to_find) const;
-        virtual const void* get_property(const char* property_name) const;
+        FdtNode get_sub_node(const char* to_find) const;
+        const void* get_property(const char* property_name) const;
+        bool has_property(const char* property_name) const;
         virtual bool is_valid() const;
     };
     
@@ -100,15 +102,28 @@ namespace fdt {
      
     };
 
+    class StructValidator : public TraversalAction {
+        public:
+
+        virtual void on_FDT_BEGIN_NODE(const fdt_header* header, const uint32_t* token) {}
+        virtual void on_FDT_END_NODE(const fdt_header* header, const uint32_t* token) {}
+        virtual void on_FDT_PROP_NODE(const fdt_header* header, const uint32_t* token) {}
+        virtual void on_FDT_NOP_NODE(const fdt_header* header, const uint32_t* token) {}
+
+    };
+
     class NodeFinder : public TraversalAction {
         FdtNode m_result;
         const char* m_search_for;  
+        bool m_node_found;
         public:
         
         NodeFinder(const char* node_name);
         
         void on_FDT_BEGIN_NODE(const fdt_header* header, const uint32_t* token) override;
      
+        bool is_action_satisfied() const override;
+
         FdtNode result() const;
     };
 
@@ -116,6 +131,8 @@ namespace fdt {
         const void* m_result = nullptr;
         const char* m_looked_property = nullptr;
         uint32_t m_property_length = 0;
+        // Given that a property can be empty, we have to flag if it has been found, as when retrieving the content the user might receive a nullptr
+        bool m_property_found = false;  
     
         public:
 
@@ -125,14 +142,15 @@ namespace fdt {
 
         void on_FDT_PROP_NODE(const fdt_header* header, const uint32_t* token) override;
         
-        const void* result() const;
+        virtual bool is_action_satisfied() const;
+
+        // The user has to be aware on how to interpret the property, given that the data is specific to each property
+        const void* property_content() const;
         uint32_t property_length() const;
+        bool is_property_found() const;
     };
 
     //Definitions ---------------------------------------------------------------------------------------------------------------------------
-
-    #define ALL_OK 0
-    #define INVALID_STRUCTURE_BLOCK -1
 
     // Definitions for FdtEngine
 
@@ -189,55 +207,60 @@ namespace fdt {
     }
 
     int FdtEngine::traverse_node(const uint32_t*& token_ptr, const fdt_header* header, TraversalAction& action) {
-        while(true) { 
-            if(action.is_action_satisfied())
-                return ALL_OK;       
-            uint32_t token = load_value(token_ptr);
-            switch(token) {
-                case FDT_BEGIN_NODE:
-                    action.on_FDT_BEGIN_NODE(header, token_ptr);
-                    token_ptr = move_to_next_token(token_ptr);
-                    traverse_node(token_ptr, header, action);
-                    break;
-                case FDT_END_NODE:
-                    action.on_FDT_END_NODE(header, token_ptr);
-                    token_ptr = move_to_next_token(token_ptr);
+        const uint32_t* start_token = token_ptr;
+        uint32_t token = load_value(token_ptr);
+        
+        // Given a node, it will traverse all of it subnodes recursively
+
+        // The first token HAS to be a FDT_BEGIN_NODE, given that the function traverses a node to its end.
+        if(token == FDT_BEGIN_NODE) {  
+            
+            action.on_FDT_BEGIN_NODE(header, token_ptr);
+            token_ptr = move_to_next_token(token_ptr);
+
+            while(true) {
+                // If the action is satisfied, we have no reason at all to keep checking the remaing of the structure
+                if(action.is_action_satisfied())
                     return ALL_OK;
-                case FDT_PROP:
-                    action.on_FDT_PROP_NODE(header, token_ptr);
-                    // Skips the struct describing the property and moves to the next token
-                    token_ptr = move_to_next_token(token_ptr);
-                    break;
-                case FDT_NOP:
-                    action.on_FDT_NOP_NODE(header, token_ptr);
-                    token_ptr = move_to_next_token(token_ptr);
-                    break;
-                default:
-                    0; //return INVALID_STRUCTURE_BLOCK;
+                token = load_value(token_ptr);
+                switch(token) {
+                    case FDT_BEGIN_NODE:
+                        // Special case, we have found another node!
+                        {
+                            auto retval = traverse_node(token_ptr, header, action);
+                            if(retval != ALL_OK)
+                                return retval;
+                        }
+                        break;
+                    case FDT_END_NODE:
+                        action.on_FDT_END_NODE(header, token_ptr);
+                        token_ptr = move_to_next_token(token_ptr);
+                        // If we started with the root node, the FDT_END token has to come next, so we check if this is the case
+                        // in the next iteration of the loop.
+                        if(start_token != get_structure_block_ptr(header))
+                            return ALL_OK;
+                        break;
+                    case FDT_PROP:
+                        action.on_FDT_PROP_NODE(header, token_ptr);
+                        token_ptr = move_to_next_token(token_ptr);
+                        break;
+                    case FDT_NOP:
+                        action.on_FDT_NOP_NODE(header, token_ptr);
+                        token_ptr = move_to_next_token(token_ptr);
+                        break;
+                    case FDT_END:
+                        // Finding a FDT_END token is only valid if we started with the root node, otherwise there is something wrong...
+                        if(start_token == get_structure_block_ptr(header))
+                            return ALL_OK;
+                        [[fallthrough]];
+                    default:
+                        return INVALID_STRUCTURE_BLOCK;
+                }
             }
         }
-    }
 
-    int FdtEngine::traverse_structure_block(const fdt_header* header, TraversalAction& action) {
-        const uint32_t* token_ptr = get_structure_block_ptr(header);
-
-        uint32_t token = load_value(token_ptr);
-        if(token != FDT_BEGIN_NODE) {
-            return INVALID_STRUCTURE_BLOCK;
-        }
-        action.on_FDT_BEGIN_NODE(header,token_ptr);
-        token_ptr = move_to_next_token(token_ptr);
-        
-        auto result = traverse_node(token_ptr, header, action);
-        
-        if(result != ALL_OK)
-            return result;
-        
-        token = load_value(token_ptr);
-        if(token != FDT_END) {
-            return INVALID_STRUCTURE_BLOCK;
-        }
-        return ALL_OK;
+        // If we have found anything else, we don't have a valid structure block or something really weird happened
+        return INVALID_STRUCTURE_BLOCK;
     }
 
     // Definitions for NodeFinder action
@@ -256,6 +279,10 @@ namespace fdt {
         }   
     }
 
+    bool NodeFinder::is_action_satisfied() const {
+        return m_result.is_valid();
+    }
+
     FdtNode NodeFinder::result() const {
         return m_result;    
     }
@@ -267,17 +294,27 @@ namespace fdt {
         auto property_name = FdtEngine::get_string_block_ptr(header) + FdtEngine::load_value(&property_descriptor->nameoff);
         
         if(strcmp(property_name, m_looked_property) == 0) {
-            m_result = token + sizeof(fdt_prop_desc)/sizeof(uint32_t) + 1; 
             m_property_length = FdtEngine::load_value(&property_descriptor->len);
+            if(m_property_length)
+                m_result = token + sizeof(fdt_prop_desc)/sizeof(uint32_t) + 1; 
+            m_property_found = true;
         }
     }
+
+    bool PropertyFinder::is_action_satisfied() const {
+        return is_property_found();
+    }
     
-    const void* PropertyFinder::result() const {
+    const void* PropertyFinder::property_content() const {
         return m_result;
     };
     
     uint32_t PropertyFinder::property_length() const {
         return m_property_length;
+    }
+
+    bool PropertyFinder::is_property_found() const {
+        return m_property_found;
     }
 
     // Definitions for FdtNode 
@@ -297,7 +334,14 @@ namespace fdt {
         PropertyFinder action(property_name);
         const uint32_t* token_ptr = m_node_token_start;
         FdtEngine::traverse_node(token_ptr, m_fdt_header, action);
-        return action.result();
+        return action.property_content();
+    }
+
+    bool FdtNode::has_property(const char* property_name) const {
+        PropertyFinder action(property_name);
+        const uint32_t* token_ptr = m_node_token_start;
+        FdtEngine::traverse_node(token_ptr, m_fdt_header, action);
+        return action.is_property_found();
     }
 
     bool FdtNode::is_valid() const {
